@@ -1,0 +1,35 @@
+ideal situation:
+
+main thread of the proxyserver:
+1. proxyserver blocking at accept
+2. client connects to proxy
+3. proxyserver accepts client and notifies a thread from the listening threadpool
+4. go to state 1
+
+listening threadpool worker:
+1. wait for a notify (wait for client to connect), blocking
+2. receive request from client
+3. parse the request
+4. if in cache, get the page from cache
+   if not in cache, notify the sending threadpool worker that has the highest percentage of waiting connections.
+5. wait for the sending threadpool worker giving the response back. Don't block, because what if the client shuts down the connection while loading a page?
+6. send page to client
+7. go to state 1
+
+sending threadpool worker:
+1. wait for a start sign
+2. make a TCP connection with the webserver
+3. wait for a notify (new content requested), but don't block, because connection needs to keep alive
+4. send request to the webserver
+5. receive response from the webserver
+6. notify the listening threadpool worker and handle the response
+7. go to state 3
+
+create a threadpool with httpconnections to the webservers
+create a threadpool with listening threadpool workers
+Server is ready now, start accepting clients
+
+exit handler:
+   close httpconnections
+   stop listening socket
+   release cache?
