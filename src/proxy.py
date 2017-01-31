@@ -13,7 +13,7 @@ import multiprocessing
 from multiprocessing import reduction
 
 def eprint(*args, **kwargs):
-        print >>sys.stderr, args
+    print >>sys.stderr, args
 
 def fatal(msg):
     eprint(msg)
@@ -34,6 +34,7 @@ class ReverseProxy(object):
             self.serversocket.bind(self.server_addr)
         except socket.error as msg:
             eprint('Bind failed. Error Code :', str(msg[0]), 'Message', msg[1])
+            #TODO: cleanup stuff
             fatal(msg)
         self.serversocket.listen(1)
         while True:
@@ -65,6 +66,10 @@ class ReverseHTTPProxy(ReverseProxy):
         #start accepting clients
         ReverseProxy.start(self)
 
+    def stop(self):
+        #TODO stop workers in listenpool
+        ReverseProxy.stop()
+
 class ProxyWorker(multiprocessing.Process):
     __metaclass__ = ABCMeta
 
@@ -88,18 +93,33 @@ class ProxyListener(ProxyWorker):
         self.__workerpipe.close()
 
     def handle_connection(self):
+        RECV_SIZE = 4096
         # TODO: change this to while running or something
         while True:
             # get a new client
             fd = reduction.recv_handle(self.__workerpipe) # stop blocking if shutdown
             clientconn =  socket.fromfd(fd, socket.AF_INET, socket.SOCK_STREAM)
             try:
+                data = ""
                 while True:
-                    data = clientconn.recv(4096)
-                    if not data:
+                    newdata = clientconn.recv(RECV_SIZE)
+                    # if connection disconnected or not end of http request, close connection 
+                    if not newdata or (len(newdata) < RECV_SIZE and newdata[-4:] != "\r\n\r\n"):
                         break
-                    print "Received data:", data
-                    clientconn.send("Hello from proxyworker %d" % (self.id))
+                    # need to receive more data
+                    elif len(newdata) == RECV_SIZE and newdata[-4:] != "\r\n\r\n":
+                        data += newdata
+                        continue
+                    
+                    data += newdata
+                    # got all data
+                    # parse data
+
+                    # if in cache, send cache
+                    # else, send request to ProxySenderPool
+                    # clientconn.send("Hello from proxyworker %d" % (self.id))
+                    clientconn.send(data)
+                    data = ""
             finally:
                 clientconn.close()
 
