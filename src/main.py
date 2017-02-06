@@ -4,6 +4,6 @@ import atexit
 
 if __name__ == "__main__":
     # TODO: read config
-    reverse_proxy = proxy.ReverseHTTPProxy("localhost",8080)
+    reverse_proxy = proxy.ReverseHTTPProxy("localhost",8081)
     #atexit.register(reverse_proxy.stop())
     reverse_proxy.start()
