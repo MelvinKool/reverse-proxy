@@ -15,6 +15,13 @@ from BaseHTTPServer import BaseHTTPRequestHandler
 from StringIO import StringIO
 import email
 
+def eprint(*args, **kwargs):
+    print >>sys.stderr, args
+
+def fatal(msg):
+    eprint(msg)
+    sys.exit(1)
+
 """
 # Using this new class is really easy!
 
@@ -29,6 +36,7 @@ print request.headers.keys()   # ['accept-charset', 'host', 'accept']
 print request.headers['host']  # "cm.bell-labs.com"
 """
 class HTTPRequest(BaseHTTPRequestHandler):
+
     def __init__(self, request_text):
         self.rfile = StringIO(request_text)
         self.raw_requestline = self.rfile.readline()
@@ -39,12 +47,46 @@ class HTTPRequest(BaseHTTPRequestHandler):
         self.error_code = code
         self.error_message = message
 
-def eprint(*args, **kwargs):
-    print >>sys.stderr, args
+class HTTPResponse(object):
 
-def fatal(msg):
-    eprint(msg)
-    sys.exit(1)
+    def __init__(self, responsecontent):
+        self.header = None
+        self.raw_header = None
+        self.body = None
+        self.error_code = None
+        # This throws a ValueError if no header is found, caller should handle this!
+        self.parse_response(responsecontent)
+    
+    def set_header(self, header):
+        response_line, headers_alone = header.split('\r\n', 1)
+        error_code_pos = response_line.index(' ') + 1
+        self.error_code = int(response_line[error_code_pos:response_line.index(' ', error_code_pos)])
+        # parse header
+        message = email.message_from_file(StringIO(headers_alone))
+        self.header = dict(message.items())
+
+    def set_body(self, body):
+        self.body = body
+
+    def parse_response(self, data):
+        # try to extract the header
+        self.headerlength = 0
+        try:
+                self.headerlength = data.index("\r\n\r\n") + 4
+        except ValueError:
+                # no end of header found, header to large?
+                raise
+        self.raw_header = data[:self.headerlength]
+        self.set_header(self.raw_header)
+        if(self.headerlength < len(data)):
+            #set the body to the part after the header
+            self.set_body(data[self.headerlength:])
+
+    """
+        Converts response back to a string
+    """
+    def __str__(self):
+        return self.raw_header + self.body
 
 class ReverseProxy(object):
 
@@ -84,8 +126,10 @@ class ReverseHTTPProxy(ReverseProxy):
         # create a threadpool with listening threadpool workers
         serverhost = "127.0.0.1"
         serverport = 8000
-        self.senderpool = ProxySenderPool(serverhost, serverport, sendersamount=8) 
-        self.listenpool = ProxyListenerPool(self.senderpool, listenersamount=senderpoolsize)
+        cachingsystem = CachingSystem()
+        self.senderpool = ProxySenderPool(serverhost, serverport, cachingsystem, sendersamount=8) 
+        self.listenpool = ProxyListenerPool(self.senderpool, cachingsystem,
+                                            listenersamount=senderpoolsize)
     
     def start(self):
         self.senderpool.start()
@@ -97,9 +141,10 @@ class ReverseHTTPProxy(ReverseProxy):
 class ProxyWorker(multiprocessing.Process):
     __metaclass__ = ABCMeta
 
-    def __init__(self, id, task):
+    def __init__(self, id, task, cachingsystem):
         self.id = id
         self._workerpipe, self.visitorpipe = multiprocessing.Pipe()
+        self.cachingsystem = cachingsystem
         # Create the process
         multiprocessing.Process.__init__(self, target=task)
 
@@ -112,8 +157,8 @@ class ProxyWorker(multiprocessing.Process):
 
 class ProxyListener(ProxyWorker):
 
-    def __init__(self, id, senderpool):
-        ProxyWorker.__init__(self, id, self.handle_connection)
+    def __init__(self, id, senderpool, cachingsystem):
+        ProxyWorker.__init__(self, id, self.handle_connection, cachingsystem)
         self.senderpool = senderpool
 
     def __del__(self):
@@ -157,7 +202,7 @@ class ProxyListener(ProxyWorker):
         RECV_SIZE = 4096
         while True:
             # get a new client
-            fd = reduction.recv_handle(self._workerpipe) # stop blocking if shutdown
+            fd = reduction.recv_handle(self._workerpipe)
             clientconn =  socket.fromfd(fd, socket.AF_INET, socket.SOCK_STREAM)
             try:
                     clientrequest = self.receive_http_request(clientconn, bufsize=RECV_SIZE)
@@ -168,22 +213,24 @@ class ProxyListener(ProxyWorker):
                         clientconn.sendall(clientrequest.rfile.getvalue())
                         continue
                     # if in cache, send cache
-                    
-                    # else, send request to ProxySenderPool
-                    sender_worker = self.senderpool.get_worker()
-                    visitorpipe = sender_worker.getpipe()
-                    visitorpipe.send(clientrequest)
-                    serverresponse = visitorpipe.recv()
-                    self.senderpool.free_worker(sender_worker)
-                    clientconn.sendall(serverresponse)
+                    # else, get the response from a server
+                    response = None
+                    # TODO:response = self.cachingsystem.get_from_cache(clientrequest)
+                    if response is None:
+                        sender_worker = self.senderpool.get_worker()
+                        visitorpipe = sender_worker.getpipe()
+                        visitorpipe.send(clientrequest)
+                        response = visitorpipe.recv()
+                        self.senderpool.free_worker(sender_worker)
+                    clientconn.sendall(str(response))
             finally:
                 clientconn.shutdown(1)
                 clientconn.close()
 
 class ProxySender(ProxyWorker):
     
-    def __init__(self, id, serverhost, serverport):
-        ProxyWorker.__init__(self, id, self.handle_connection)
+    def __init__(self, id, serverhost, serverport, cachingsystem):
+        ProxyWorker.__init__(self, id, self.handle_connection, cachingsystem)
         self.serverhost = serverhost
         self.serverport = serverport
         self.serversock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -200,45 +247,17 @@ class ProxySender(ProxyWorker):
                 if not newdata:
                     break
                 data += newdata 
-
-            headerlength = 0
-            try:
-                    headerlength = data.index("\r\n\r\n") + 4
-            except ValueError:
-                    # no end of header found, header to large?
-                    return None
-            raw_header = data[:headerlength]
-            response_line, headers_alone = raw_header.split('\r\n', 1)
-            message = email.message_from_file(StringIO(headers_alone))
-            responseheader = dict(message.items())
-            error_code_pos = response_line.index(' ') + 1
-            error_code = int(response_line[error_code_pos:response_line.index(' ', error_code_pos)])
+            http_response = HTTPResponse(data)
             # no body in a response on the HEAD command
             # no body in 1xx, 204 and 304 response
             body_length = 0
-            if (request.command == "HEAD" or 100 <= error_code < 200 
-                or error_code in [204,304]):
-                return raw_header
-            #elif 'Content-Length' in responseheader.keys():
-            #    # if request contains a message body and no content-length, 
-            #    # return 400 bad request or 411 length
-            #    responsebody = ("<!DOCTYPE HTML>"
-            #                "<html><head></head><body>"
-            #                "<h1>Webserver doesn't give the content-length, but it has a body</h1>"
-            #                "</body></html>")
-            #    responseheader = ("HTTP/1.0 400 Bad Request\r\n"
-            #                "Content-Length: %d\r\n" % (len(responsebody)) +
-            #                "\r\n")
-            #    return responseheader + responsebody
-            #else:
-            #    # There is no body in this request, return request
-            #    eprint("no body, returning request")
-            #    return raw_header
-            
+            if (request.command == "HEAD" or 100 <= http_response.error_code < 200 or 
+                http_response.error_code in [204,304]):
+                return http_response
             # read till the end of the response or till the server closes the connection
-            if 'Content-Length' in responseheader.keys():
-                body_length = int(responseheader['Content-Length'])
-                while (len(data) - headerlength) < body_length:
+            if 'Content-Length' in http_response.header.keys():
+                body_length = int(http_response.header['Content-Length'])
+                while (len(data) - http_response.headerlength) < body_length:
                     newdata = sock.recv(bufsize)
                     if not newdata:
                         break
@@ -250,7 +269,10 @@ class ProxySender(ProxyWorker):
                         break
                     data += newdata
             # Return the request with the complete body
-            return data
+            raw_body = data[http_response.headerlength:]
+            http_response.set_body(raw_body)
+            self.cachingsystem.update_cache(request, http_response)
+            return http_response
 
     def handle_connection(self):
         BUFSIZE = 4096
@@ -264,13 +286,7 @@ class ProxySender(ProxyWorker):
                 response = self.receive_http_response(self.serversock, request, bufsize=BUFSIZE)
             finally:
                 self.serversock.close()
-            #response = ("HTTP/1.0 200 OK\r\n"
-            #            "Server: BaseHTTP/0.3 Python/2.7.13\r\n"
-            #            "Date: Sat, 04 Feb 2017 11:02:23 GMT\r\n"
-            #            "\r\n\r\n"
-            #            "Thread-51\r\n\r\n")
-
-            ## send the response back to the proxy listener
+            # send the response back to the proxy listener
             self._workerpipe.send(response)
 
 class ProxyPool(object):
@@ -300,23 +316,60 @@ class ProxyPool(object):
 
 class ProxyListenerPool(ProxyPool):
 
-    def __init__(self, senderpool, listenersamount=8):
+    def __init__(self, senderpool, cachingsystem, listenersamount=8):
         ProxyPool.__init__(self)
         self.senderpool = senderpool
-        self.create_workers(listenersamount)
+        self.create_workers(cachingsystem, listenersamount)
 
-    def create_workers(self, worker_amount=8, **args):
+    def create_workers(self, cachingsystem, worker_amount=8, **args):
         for i in range(0,worker_amount):
-            self.add_worker(ProxyListener(i, self.senderpool)) 
+            self.add_worker(ProxyListener(i, self.senderpool, cachingsystem)) 
 
 class ProxySenderPool(ProxyPool):
     
-    def __init__(self, serverhost, serverport, sendersamount=8):
+    def __init__(self, serverhost, serverport, cachingsystem, sendersamount=8):
         ProxyPool.__init__(self)
         self.serverhost = serverhost
         self.serverport = serverport
-        self.create_workers(self.serverhost, self.serverport)
+        self.create_workers(self.serverhost, self.serverport, cachingsystem)
 
-    def create_workers(self, serverhost, serverport, worker_amount=8, **args):
+    def create_workers(self, serverhost, serverport, cachingsystem, worker_amount=8, **args):
         for i in range(0, worker_amount):
-            self.add_worker(ProxySender(i, serverhost, serverport)) 
+            self.add_worker(ProxySender(i, serverhost, serverport, cachingsystem)) 
+
+class CachingSystem(object):
+    
+    def __init__(self):
+        self.cache = {}
+        self.cachelock = multiprocessing.Lock()
+    
+    """
+        Updates the cache.
+        Returns True if cache is updated, else otherwise.
+    """
+    def update_cache(self, request, response):
+        # parse request
+        
+        # update cache if the response is 200 and the request command is get
+        if request.command == "GET" and response.error_code == 200:
+            self.cachelock.acquire()
+            # update cache
+            # TODO
+            self.cachelock.release()
+            return True
+        return False
+
+    """
+        Handles the caching of a request.
+        If the requested resource is not found, or the cache is out of date, None is returned.
+        The object is returned, otherwise.
+    """
+    def get_from_cache(self, request):
+        cachedobject = None
+        self.cachelock.acquire()
+        if request.path in self.cache:
+            cachedobject = self.cache[request.path]
+            # TODO: if cached item is out of date, delete it from the cache
+        self.cachelock.release()
+        return cachedobject
+
