@@ -121,15 +121,14 @@ class ReverseProxy(object):
 
 class ReverseHTTPProxy(ReverseProxy):
 
-    def __init__(self, host, port, listenpoolsize=8, senderpoolsize=8, **args):
+    def __init__(self, host, port, config):
         ReverseProxy.__init__(self, host, port)
-        # create a threadpool with listening threadpool workers
-        serverhost = "127.0.0.1"
-        serverport = 8000
         cachingsystem = CachingSystem()
-        self.senderpool = ProxySenderPool(serverhost, serverport, cachingsystem, sendersamount=8) 
+        cachingsystem.set_caching_time(config['cache_time'])
+        self.senderpool = ProxySenderPool(config['Servers'], cachingsystem) 
+        # create a threadpool with listening threadpool workers
         self.listenpool = ProxyListenerPool(self.senderpool, cachingsystem,
-                                            listenersamount=senderpoolsize)
+                                            listenersamount=config['listen_processes'])
     
     def start(self):
         self.senderpool.start()
@@ -327,21 +326,24 @@ class ProxyListenerPool(ProxyPool):
 
 class ProxySenderPool(ProxyPool):
     
-    def __init__(self, serverhost, serverport, cachingsystem, sendersamount=8):
+    def __init__(self, servers, cachingsystem):
         ProxyPool.__init__(self)
-        self.serverhost = serverhost
-        self.serverport = serverport
-        self.create_workers(self.serverhost, self.serverport, cachingsystem)
+        self.create_workers(servers, cachingsystem)
 
-    def create_workers(self, serverhost, serverport, cachingsystem, worker_amount=8, **args):
-        for i in range(0, worker_amount):
-            self.add_worker(ProxySender(i, serverhost, serverport, cachingsystem)) 
+    def create_workers(self, servers, cachingsystem):
+        i = 0
+        for server in servers:
+            for newproc in range(0, server['sending_processes']):
+                self.add_worker(ProxySender(i, server['address'], server['port'], cachingsystem)) 
+                i += 1
+
 
 class CachingSystem(object):
     
     def __init__(self):
         self.cache = {}
         self.cachelock = multiprocessing.Lock()
+        self.cachingtime = 3600
     
     """
         Updates the cache.
@@ -373,3 +375,8 @@ class CachingSystem(object):
         self.cachelock.release()
         return cachedobject
 
+    """
+        Set the amount of seconds till a cached item becomes out of date
+    """
+    def set_caching_time(self, time):
+        self.cachingtime = time
