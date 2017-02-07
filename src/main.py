@@ -2,6 +2,7 @@
 import proxy
 import atexit
 import ConfigParser
+import sys
 
 def read_config(filepath):
     config = ConfigParser.SafeConfigParser()
@@ -46,7 +47,11 @@ def print_config(config):
     print "==================="
 
 if __name__ == "__main__":
-    configfile = "tests/example.cfg"
+    if len(sys.argv) > 1:
+        configfile = sys.argv[1]
+    else:
+        print >>sys.stderr, "Usage: {} <configfile>".format(sys.argv[0])
+        sys.exit(1)
     config = read_config(configfile)
     print_config(config)
     reverse_proxy = proxy.ReverseHTTPProxy(config['proxy_addr'], config['proxy_port'], config)

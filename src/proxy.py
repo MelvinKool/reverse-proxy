@@ -14,6 +14,7 @@ from multiprocessing import reduction
 from BaseHTTPServer import BaseHTTPRequestHandler
 from StringIO import StringIO
 import email
+import time
 
 def eprint(*args, **kwargs):
     print >>sys.stderr, args
@@ -128,7 +129,7 @@ class ReverseHTTPProxy(ReverseProxy):
         self.senderpool = ProxySenderPool(config['Servers'], cachingsystem) 
         # create a threadpool with listening threadpool workers
         self.listenpool = ProxyListenerPool(self.senderpool, cachingsystem,
-                                            listenersamount=config['listen_processes'])
+                                        listenersamount=config['listen_processes'])
     
     def start(self):
         self.senderpool.start()
@@ -213,14 +214,11 @@ class ProxyListener(ProxyWorker):
                         continue
                     # if in cache, send cache
                     # else, get the response from a server
-                    response = None
-                    # TODO:response = self.cachingsystem.get_from_cache(clientrequest)
-                    if response is None:
-                        sender_worker = self.senderpool.get_worker()
-                        visitorpipe = sender_worker.getpipe()
-                        visitorpipe.send(clientrequest)
-                        response = visitorpipe.recv()
-                        self.senderpool.free_worker(sender_worker)
+                    sender_worker = self.senderpool.get_worker()
+                    visitorpipe = sender_worker.getpipe()
+                    visitorpipe.send(clientrequest)
+                    response = visitorpipe.recv()
+                    self.senderpool.free_worker(sender_worker)
                     clientconn.sendall(str(response))
             finally:
                 clientconn.shutdown(1)
@@ -281,10 +279,12 @@ class ProxySender(ProxyWorker):
             request = self._workerpipe.recv() 
             self.serversock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.serversock.connect((self.serverhost, self.serverport))
-            try:
-                response = self.receive_http_response(self.serversock, request, bufsize=BUFSIZE)
-            finally:
-                self.serversock.close()
+            response = self.cachingsystem.get_from_cache(request)
+            if response is None:
+                try:
+                    response = self.receive_http_response(self.serversock, request, bufsize=BUFSIZE)
+                finally:
+                    self.serversock.close()
             # send the response back to the proxy listener
             self._workerpipe.send(response)
 
@@ -350,13 +350,16 @@ class CachingSystem(object):
         Returns True if cache is updated, else otherwise.
     """
     def update_cache(self, request, response):
-        # parse request
-        
+        print "Caching:", request.path
+        print self.cache
         # update cache if the response is 200 and the request command is get
         if request.command == "GET" and response.error_code == 200:
             self.cachelock.acquire()
             # update cache
-            # TODO
+            self.cache[request.path] = {
+                        'time' : time.time(),
+                        'response' : response
+                    }
             self.cachelock.release()
             return True
         return False
@@ -367,13 +370,19 @@ class CachingSystem(object):
         The object is returned, otherwise.
     """
     def get_from_cache(self, request):
-        cachedobject = None
+        print "Getting cached object:", request.path
+        response = None
         self.cachelock.acquire()
+        print "it is in {}".format(request.path in self.cache)
+        print self.cache
         if request.path in self.cache:
             cachedobject = self.cache[request.path]
-            # TODO: if cached item is out of date, delete it from the cache
+            if time.time() - cachedobject['time'] > self.cachingtime:
+                del self.cache[request.path]
+            else:
+                response = cachedobject['response']
         self.cachelock.release()
-        return cachedobject
+        return response
 
     """
         Set the amount of seconds till a cached item becomes out of date
